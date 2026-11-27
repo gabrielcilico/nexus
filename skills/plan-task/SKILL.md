@@ -5,4 +5,11 @@ description: Plan a project change in small steps with verifiable outcomes.
 
 # plan-task
 
-When the selected domain is known and authorized, query `nexus config get base_branch build_command test_command lint_command --domain <domain>` for relevant fields. Inspect the affected entry points and nearby tests. State the outcome, implementation steps, and how to verify each risky change. For a small change, keep the plan to a few lines. Surface only decisions that materially change scope or behavior.
+Inspect the affected entry points and nearby tests. If the plan needs an
+approved convention and the session may read it, fetch only that field with
+`nexus config get <field> --domain <domain>` from the selected checkout.
+Use `--project` with a quoted path when working elsewhere.
+
+State the outcome, implementation steps, and verification for each risky
+change. Keep small changes to a few lines and surface decisions that change
+scope or behavior.

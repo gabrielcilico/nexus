@@ -1,6 +1,8 @@
 import json
+import os
 import subprocess
 from pathlib import Path
+from stat import S_IMODE
 
 import pytest
 from typer.testing import CliRunner
@@ -109,6 +111,8 @@ def test_recover_interrupted_install(project, monkeypatch):
     written = []
 
     def interrupt(path, data):
+        if path.name != "SKILL.md":
+            return real_write(path, data)
         if written:
             raise OSError("Interrupted")
         real_write(path, data)
@@ -146,10 +150,219 @@ def test_config_is_private_and_explicit(project, tmp_path):
 
 def test_discovery_does_not_execute_commands(project):
     (project / "README.md").write_text("make build\npytest\n", encoding="utf-8")
-    response = json.loads(run(project, "discover", "--domain", "personal").output)
+    response = json.loads(
+        run(project, "discover", "--domain", "personal", "--show-evidence").output
+    )
     assert response["base_branch"]["status"] == "unknown"
     assert [item["candidate"] for item in response["command_candidates"]] == [
         "make build",
         "pytest",
     ]
     assert project_data(project, "personal").joinpath("discovery.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "failure", ["syntax", "schema", "hash", "duplicate", "skill-name", "path"]
+)
+def test_corrupt_manifest_stops_before_changes(project, failure):
+    install(project, "--skill", "plan-task")
+    manifest = installation_data(project) / "installation.json"
+    record = json.loads(manifest.read_bytes())
+    file = installation.target(project, "plan-task")
+    before = file.read_bytes()
+    if failure == "syntax":
+        data = "{"
+    elif failure == "schema":
+        data = "[]"
+    elif failure == "duplicate":
+        data = '{"pending":null,' + manifest.read_text().lstrip()[1:]
+    elif failure == "hash":
+        record["current"]["files"]["plan-task"]["text"] = "Changed snapshot"
+        data = json.dumps(record)
+    elif failure == "skill-name":
+        record["current"]["files"]["nested/plan-task"] = record["current"]["files"].pop(
+            "plan-task"
+        )
+        data = json.dumps(record)
+    else:
+        record["current"]["files"]["plan-task"]["path"] = "notes.md"
+        data = json.dumps(record)
+    manifest.write_text(data, encoding="utf-8")
+    for action in ("status", "update", "rollback", "uninstall"):
+        response = run(project, action, code=1)
+        assert "Invalid installation manifest" in response.output
+    assert file.read_bytes() == before
+    assert manifest.read_text() == data
+
+
+@pytest.mark.parametrize("state", ["missing", "modified", "directory"])
+def test_destination_drift_blocks_batch(project, state):
+    install(project, "--skill", "plan-task", "--skill", "review-code")
+    changed = installation.target(project, "review-code")
+    unaffected = installation.target(project, "plan-task")
+    changed.unlink()
+    if state == "modified":
+        changed.write_text("Manual edit", encoding="utf-8")
+    elif state == "directory":
+        changed.mkdir()
+    manifest = installation_data(project) / "installation.json"
+    before = manifest.read_bytes()
+    run(project, "uninstall", code=1)
+    assert unaffected.is_file()
+    assert manifest.read_bytes() == before
+
+
+def test_interrupted_update_requires_matching_operation(project, tmp_path, monkeypatch):
+    install(project, "--skill", "plan-task", "--skill", "review-code")
+    source = tmp_path / "replacement source"
+    for name in ("plan-task", "review-code"):
+        path = source / "skills" / name / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(
+            (SOURCE / "skills" / name / "SKILL.md").read_bytes() + b"\nNew.\n"
+        )
+
+    real_write = installation.atomic_write
+
+    def fail_second_skill(path, data):
+        if path.name == "SKILL.md" and path.parent.name == "review-code":
+            raise PermissionError(13, "Permission denied")
+        real_write(path, data)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(installation, "atomic_write", fail_second_skill)
+        failed = run(project, "update", "--source", str(source), code=1)
+        assert "Check permissions and paths" in failed.output
+    ready = installation.target(project, "plan-task")
+    waiting = installation.target(project, "review-code")
+    before_waiting = waiting.read_bytes()
+    assert ready.read_bytes().endswith(b"New.\n")
+    assert json.loads(run(project, "status").output)["pending_action"] == "update"
+    rejected = run(project, "uninstall", code=1)
+    assert "Retry that command first" in rejected.output
+    assert waiting.read_bytes() == before_waiting
+    run(project, "update", "--source", str(tmp_path / "unavailable source"))
+    assert waiting.read_bytes().endswith(b"New.\n")
+    run(project, "rollback")
+    assert waiting.read_bytes() == before_waiting
+
+
+def test_discovery_limits_output_and_persists_evidence(project):
+    marker = "synthetic-private-marker"
+    (project / "README.md").write_text(f"make {marker}\n", encoding="utf-8")
+    response = run(project, "discover", "--domain", "personal")
+    assert marker not in response.output
+    assert json.loads(response.output)["command_candidate_count"] == 1
+    state = project_data(project, "personal")
+    report = state / "discovery.json"
+    assert marker in report.read_text(encoding="utf-8")
+    detailed = run(project, "discover", "--domain", "personal", "--show-evidence")
+    assert marker in detailed.output
+    if os.name == "posix":
+        assert S_IMODE(report.stat().st_mode) == 0o600
+        assert S_IMODE(state.stat().st_mode) == 0o700
+
+
+def test_config_errors_omit_private_values(project):
+    state = project_data(project, "work")
+    state.mkdir(parents=True)
+    path = state / "conventions.yaml"
+    path.write_text("test_command: [synthetic-private-value]\n", encoding="utf-8")
+    response = run(project, "config", "get", "test_command", "--domain", "work", code=1)
+    assert "Invalid conventions.yaml" in response.output
+    assert "synthetic-private-value" not in response.output
+
+
+def test_private_data_cannot_use_a_working_tree(project, monkeypatch):
+    monkeypatch.setenv("NEXUS_DATA_DIR", str(project / "private"))
+    run(project, "discover", "--domain", "personal", code=1)
+    assert not (project / "private").exists()
+
+
+def test_installer_rejects_linked_skill_directory(project, tmp_path):
+    outside = tmp_path / "separate directory"
+    outside.mkdir()
+    skills = project / ".claude" / "skills"
+    skills.parent.mkdir()
+    if os.name == "nt":
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                (
+                    "New-Item -ItemType Junction -Path $env:NEXUS_TEST_LINK -Target "
+                    "$env:NEXUS_TEST_LINK_TARGET -ErrorAction Stop | Out-Null"
+                ),
+            ],
+            env=os.environ
+            | {"NEXUS_TEST_LINK": str(skills), "NEXUS_TEST_LINK_TARGET": str(outside)},
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            pytest.skip("Junction creation is unavailable on this host")
+    else:
+        skills.symlink_to(outside, target_is_directory=True)
+    response = install(project, "--skill", "plan-task", code=1)
+    assert "Linked path" in response.output
+    assert not list(outside.iterdir())
+
+
+def test_invalid_source_and_destination(project, tmp_path):
+    source = tmp_path / "invalid source"
+    bad = source / "skills" / "plan-task" / "SKILL.md"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"---\nname: plan-task\ndescription: Example.\n---\n\xff")
+    run(project, "install", "--source", str(source), code=1)
+    run(tmp_path / "missing project", "install", "--source", str(SOURCE), code=1)
+    assert not (project / ".claude").exists()
+
+
+def test_uninstall_preserves_hard_linked_file(project, tmp_path):
+    install(project, "--skill", "plan-task")
+    managed = installation.target(project, "plan-task")
+    separate = tmp_path / "copy.md"
+    original = managed.read_bytes()
+    os.link(managed, separate)
+    run(project, "uninstall", code=1)
+    assert managed.read_bytes() == separate.read_bytes() == original
+
+
+def test_nested_source_has_no_parent_git_revision(project):
+    source = project / "nested source"
+    skill = source / "skills" / "plan-task" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_bytes((SOURCE / "skills" / "plan-task" / "SKILL.md").read_bytes())
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Synthetic commit",
+        ],
+        capture_output=True,
+        check=True,
+    )
+    assert installation.snapshot(source, ["plan-task"])["revision"] is None
+
+
+def test_subdirectory_and_doctor(project):
+    working_dir = project / "folder with spaces"
+    working_dir.mkdir()
+    install(project, "--skill", "plan-task")
+    assert json.loads(run(working_dir, "status").output)["skills"] == {
+        "plan-task": "installed"
+    }
+    response = RUNNER.invoke(app, ["doctor"])
+    assert response.exit_code == 0
+    assert set(json.loads(response.output)) == {"git", "claude", "uv"}

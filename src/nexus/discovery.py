@@ -5,7 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .storage import checked
+from .storage import checked, regular_file
 
 FILES = {
     "documentation": ("README*", "docs/*.md"),
@@ -47,13 +47,15 @@ COMMAND = re.compile(
 )
 
 
-def git(project: Path, *args: str) -> str:
+def git(project: Path, *args: str, require_success: bool = False) -> str:
     environment = {
         key: value
         for key, value in os.environ.items()
         if not key.upper().startswith("GIT_")
     }
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment["GIT_NO_LAZY_FETCH"] = "1"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     result = subprocess.run(
         ["git", "--no-pager", "-c", "core.fsmonitor=false", "-C", str(project), *args],
         capture_output=True,
@@ -63,6 +65,8 @@ def git(project: Path, *args: str) -> str:
         env=environment,
         check=False,
     )
+    if result.returncode and require_success:
+        raise ValueError("Git could not verify the source checkout")
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -78,13 +82,18 @@ def discover(project: Path) -> dict:
     for category, patterns in FILES.items():
         paths = set()
         for pattern in patterns:
-            for path in project.glob(pattern):
-                relative = path.relative_to(project)
+            directory, _, wildcard = pattern.rpartition("/")
+            try:
+                folder = checked(project, Path(directory))
+            except ValueError:
+                continue
+            for path in folder.glob(wildcard):
+                relative = Path(directory, path.name)
                 try:
-                    candidate = checked(project, relative)
+                    available = regular_file(checked(project, relative))
                 except ValueError:
                     continue
-                if candidate.is_file():
+                if available:
                     paths.add(relative.as_posix())
         evidence.append(
             {
@@ -116,7 +125,8 @@ def discover(project: Path) -> dict:
     branches = git(
         project, "for-each-ref", "--count=20", "--format=%(refname:short)", "refs/heads"
     )
-    subjects = git(project, "log", "-12", "--format=%s", "HEAD")
+    subjects = git(project, "log", "-12", "--format=%s", "HEAD").splitlines()
+    conventional = re.compile(r"^[a-z]+(?:\([^)]*\))?!?: ")
     return {
         "files": evidence,
         "layout": sorted(
@@ -124,10 +134,34 @@ def discover(project: Path) -> dict:
         )[:40],
         "command_candidates": commands[:30],
         "branches": branches.splitlines(),
-        "recent_commit_subjects": [line[:160] for line in subjects.splitlines()],
+        "commit_format": {
+            "source": "latest 12 local commit subjects",
+            "sample_size": len(subjects),
+            "conventional_matches": sum(
+                bool(conventional.match(line)) for line in subjects
+            ),
+            "status": "inferred" if subjects else "unknown",
+        },
         "base_branch": {
             "status": "inferred" if default_ref else "unknown",
             "candidate": default_ref.removeprefix("refs/remotes/origin/") or None,
             "source": "refs/remotes/origin/HEAD" if default_ref else None,
         },
+    }
+
+
+def summarize(report: dict) -> dict:
+    return {
+        "files": [
+            {
+                "category": item["category"],
+                "status": item["status"],
+                "count": len(item["files"]),
+            }
+            for item in report["files"]
+        ],
+        "command_candidate_count": len(report["command_candidates"]),
+        "branch_count": len(report["branches"]),
+        "commit_format": report["commit_format"],
+        "base_branch_status": report["base_branch"]["status"],
     }
