@@ -14,16 +14,34 @@ the SHA-256 of the normalized canonical checkout path. Select the domain
 explicitly. Project fields override domain fields. Only requested convention
 fields are returned by `config get`.
 
+Discovery saves a separate evidence report. Standard output shows counts and
+evidence status by default. Detailed output is explicit, and raw commit
+subjects are reduced to format counts. Source files and commands found in
+them are evidence to evaluate. Nexus does not run those commands.
+
 Installation state belongs to a physical checkout and is stored under
 `installations/<project-key>/`. It is shared across domain selections because
 Claude Code discovers the same installed public files in that checkout. The
 manifest retains the current and previous snapshots. A pending record supports
 retrying a partially applied file operation. Hash comparison detects local
-changes. Cooperating Nexus processes serialize mutations per checkout. Keep
-other editors and installers away from managed paths during a mutation.
+changes. Before a mutation, Nexus validates the manifest structure, verifies
+snapshot hashes, and checks affected destinations. The manifest stores validated
+skill identifiers. Nexus derives destinations beneath the Claude Code skill
+root. Hashes detect changes relative to local state. Source authenticity
+depends on verifying the checkout independently. A writer that can replace the
+manifest can also replace its hashes. Nexus records a source revision only
+when the source skill tree passes Git status checks and the selected files
+match the commit blobs after line-ending normalization. A pending action resumes
+only when its command is retried, using the recorded snapshot. Cooperating
+Nexus processes serialize mutations per checkout. Keep other editors and
+installers away from managed paths during a mutation.
 
-These controls scope Nexus operations. A runtime running as the same OS user
-can have broader access. Real domain separation requires external account,
-filesystem, process, and network controls. Invoking a skill may send selected
-context to its model provider. Autonomous orchestration, persistent knowledge
-retrieval, and additional adapters are future work.
+Domain selection scopes normal Nexus operations. Storage is external to Git
+working trees. Newly created private directories and files use owner-only
+permissions on POSIX. Windows inherits ACLs from the data directory. Review
+existing permissions and give each sensitive domain a dedicated account or
+execution environment with restricted storage, processes, and network access.
+The same OS user can choose another domain or read its files directly.
+Invoking a skill may send selected context to its model provider. Skill
+invocation metadata scopes context loading in Claude Code. OS and runtime
+permissions govern file access.

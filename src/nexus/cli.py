@@ -11,8 +11,16 @@ import typer
 import yaml
 
 from . import config, installation
-from .discovery import discover, project_root
-from .storage import checked, installation_data, locked, project_data, write_json
+from .discovery import discover, project_root, summarize
+from .storage import (
+    checked,
+    installation_data,
+    locked,
+    prepare_private_directory,
+    project_data,
+    regular_file,
+    write_json,
+)
 
 app = typer.Typer(no_args_is_help=True)
 skills = typer.Typer(no_args_is_help=True)
@@ -26,7 +34,19 @@ def guarded(function):
     def invoke(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except (OSError, ValueError, SubprocessError, yaml.YAMLError) as error:
+        except OSError:
+            typer.echo(
+                "Error: Local filesystem or program access failed. Check permissions and paths.",
+                err=True,
+            )
+            raise typer.Exit(1) from None
+        except SubprocessError:
+            typer.echo(
+                "Error: Local Git inspection failed. Check the selected working tree.",
+                err=True,
+            )
+            raise typer.Exit(1) from None
+        except (ValueError, yaml.YAMLError) as error:
             typer.echo(f"Error: {error}", err=True)
             raise typer.Exit(1) from error
 
@@ -57,13 +77,19 @@ def doctor():
 def inspect(
     domain: Annotated[str, typer.Option()],
     project: Annotated[Path, typer.Option()] = Path("."),
+    show_evidence: Annotated[
+        bool, typer.Option(help="Print private paths and command candidates")
+    ] = False,
 ):
     """Save local discovery evidence outside the project and print a summary."""
     root = project_root(project)
     state = project_data(root, domain)
     report = discover(root)
-    write_json(checked(state, Path("discovery.json")), report)
-    emit(report)
+    destination = checked(state, Path("discovery.json"))
+    regular_file(destination)
+    prepare_private_directory(state)
+    write_json(destination, report)
+    emit(report if show_evidence else summarize(report))
 
 
 @config_app.command("get")
@@ -92,6 +118,8 @@ def set_config(
     """Store a convention approved for this project."""
     if not approve:
         raise ValueError("Review the convention and pass --approve to save it")
+    if field not in config.Conventions.model_fields:
+        raise ValueError("Unknown convention field")
     state = project_data(project_root(project), domain)
     with locked(checked(state, Path("config.lock"))):
         config.set_convention(state, field, value)
