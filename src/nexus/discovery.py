@@ -47,7 +47,7 @@ COMMAND = re.compile(
 )
 
 
-def git(project: Path, *args: str, require_success: bool = False) -> str:
+def _run_git(project: Path, *args: str) -> bytes | None:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -56,18 +56,40 @@ def git(project: Path, *args: str, require_success: bool = False) -> str:
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_NO_LAZY_FETCH"] = "1"
     environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GIT_ALLOW_PROTOCOL"] = ""
     result = subprocess.run(
-        ["git", "--no-pager", "-c", "core.fsmonitor=false", "-C", str(project), *args],
+        [
+            "git",
+            "--no-pager",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-C",
+            str(project),
+            *args,
+        ],
         capture_output=True,
-        encoding="utf-8",
-        errors="replace",
         timeout=10,
         env=environment,
         check=False,
     )
-    if result.returncode and require_success:
+    return result.stdout if result.returncode == 0 else None
+
+
+def git(project: Path, *args: str, require_success: bool = False) -> str:
+    output = _run_git(project, *args)
+    if output is None and require_success:
         raise ValueError("Git could not verify the source checkout")
-    return result.stdout.strip() if result.returncode == 0 else ""
+    return (
+        output.decode("utf-8", errors="replace").strip() if output is not None else ""
+    )
+
+
+def git_blob(project: Path, object_name: str, max_size: int) -> bytes | None:
+    size = _run_git(project, "cat-file", "-s", object_name)
+    if size is None or not size.strip().isdigit() or int(size) > max_size:
+        return None
+    return _run_git(project, "cat-file", "blob", object_name)
 
 
 def project_root(path: Path) -> Path:

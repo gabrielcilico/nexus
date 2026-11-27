@@ -33,7 +33,9 @@ Use a trusted, clean tag or commit checkout as `--source` when pinning a
 version. `nexus update` retains the installed selection by default. Repeat
 `--skill` to replace that selection. `nexus rollback` restores the previous
 snapshot. `nexus uninstall` removes matching managed skill files, preserving
-other files and reporting conflicts. With either command, `--project` points
+directories and reporting conflicts. Rollback can restore a missing
+`SKILL.md` alongside unmanaged files and refuses an occupied destination.
+With either command, `--project` points
 to the target checkout.
 
 If `nexus status` reports a pending action, retry that action for the same

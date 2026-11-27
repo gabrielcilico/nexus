@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from subprocess import SubprocessError
 from typing import Annotated, Literal
 
 import yaml
@@ -9,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
 
 from .adapters.claude_code import SKILL_ROOT, render
 from .config import load_yaml
-from .discovery import git
+from .discovery import git, git_blob
 from .storage import atomic_write, checked, digest, locked, regular_file, slug
 
 EMPTY = {"revision": None, "files": {}}
@@ -124,16 +125,24 @@ def snapshot(source: Path, names: list[str]) -> dict:
         if name not in available:
             raise ValueError(f"Unknown skill: {name}")
     contents = {name: render(available[name]) for name in chosen}
-    root = git(source, "rev-parse", "--show-toplevel")
-    revision = None
-    if root and Path(root).resolve() == source.resolve():
-        tracked = set(
-            git(
-                source, "ls-tree", "-r", "--name-only", "HEAD", "--", "skills"
-            ).splitlines()
-        )
-        expected = {f"skills/{name}/SKILL.md" for name in chosen}
-        if expected <= tracked and not git(
+    return {
+        "revision": verified_revision(
+            source, {name: available[name] for name in chosen}
+        ),
+        "files": {
+            name: {"sha256": digest(data), "text": data.decode("utf-8")}
+            for name, data in contents.items()
+        },
+    }
+
+
+def verified_revision(source: Path, selected: dict[str, bytes]) -> str | None:
+    try:
+        root = git(source, "rev-parse", "--show-toplevel")
+        if not root or Path(root).resolve() != source.resolve():
+            return None
+        revision = git(source, "rev-parse", "--verify", "HEAD^{commit}")
+        if not revision or git(
             source,
             "status",
             "--porcelain",
@@ -142,14 +151,14 @@ def snapshot(source: Path, names: list[str]) -> dict:
             "skills",
             require_success=True,
         ):
-            revision = git(source, "rev-parse", "HEAD") or None
-    return {
-        "revision": revision,
-        "files": {
-            name: {"sha256": digest(data), "text": data.decode("utf-8")}
-            for name, data in contents.items()
-        },
-    }
+            return None
+        for name, contents in selected.items():
+            blob = git_blob(source, f"{revision}:skills/{name}/SKILL.md", 2 * MAX_SKILL)
+            if blob is None or blob.replace(b"\r\n", b"\n") != contents:
+                return None
+        return revision
+    except (OSError, ValueError, SubprocessError):
+        return None
 
 
 def target(project: Path, name: str) -> Path:
@@ -194,15 +203,25 @@ def content_at(path: Path) -> bytes | None:
         return stream.read(MAX_INSTALLED + 1)
 
 
-def scan(project: Path, before: dict, after: dict, *, recovery: bool) -> list:
+def scan(
+    project: Path, before: dict, after: dict, *, recovery: bool, restoring: bool = False
+) -> list:
     operations = []
     for name in sorted(before.keys() | after.keys()):
         path = target(project, name)
         original = before.get(name)
         desired = after.get(name)
-        if not original and not recovery and path.parent.exists():
+        if (
+            not original
+            and not recovery
+            and not restoring
+            and path.parent.is_dir()
+            and any(path.parent.iterdir())
+        ):
             raise ValueError(f"Skill directory already exists: {name}")
         observed = content_at(path)
+        if not original and not recovery and observed is not None:
+            raise ValueError(f"Unmanaged SKILL.md already exists: {name}")
         current = digest(observed) if observed is not None else None
         old_hash = original["sha256"] if original else None
         new_hash = desired["sha256"] if desired else None
@@ -226,8 +245,6 @@ def finish(project: Path, path: Path, record: dict) -> None:
     ):
         if data is None:
             destination.unlink()
-            if not any(destination.parent.iterdir()):
-                destination.parent.rmdir()
         else:
             atomic_write(destination, data)
     save_state(path, {"current": after, "previous": before, "pending": None})
@@ -268,7 +285,13 @@ def change(
         }[action]
         if next_state is None:
             raise ValueError("No previous installation is available")
-        scan(project, current["files"], next_state["files"], recovery=False)
+        scan(
+            project,
+            current["files"],
+            next_state["files"],
+            recovery=False,
+            restoring=action == "rollback",
+        )
         if next_state != current:
             record["pending"] = {"action": action, "next": next_state}
             save_state(path, record)

@@ -29,7 +29,9 @@ snapshot hashes, and checks affected destinations. The manifest stores validated
 skill identifiers. Nexus derives destinations beneath the Claude Code skill
 root. Hashes detect changes relative to local state. Source authenticity
 depends on verifying the checkout independently. A writer that can replace the
-manifest can also replace its hashes. A pending action resumes
+manifest can also replace its hashes. Nexus records a source revision only
+when the source skill tree passes Git status checks and the selected files
+match the commit blobs after line-ending normalization. A pending action resumes
 only when its command is retried, using the recorded snapshot. Cooperating
 Nexus processes serialize mutations per checkout. Keep other editors and
 installers away from managed paths during a mutation.

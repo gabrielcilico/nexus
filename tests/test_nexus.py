@@ -356,6 +356,94 @@ def test_nested_source_has_no_parent_git_revision(project):
     assert installation.snapshot(source, ["plan-task"])["revision"] is None
 
 
+@pytest.fixture
+def committed_skill(project):
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(project), *args], capture_output=True, check=True
+        ).stdout.strip()
+
+    path = project / "skills/plan-task/SKILL.md"
+    path.parent.mkdir(parents=True)
+    contents = (
+        (SOURCE / "skills/plan-task/SKILL.md").read_bytes().replace(b"\r\n", b"\n")
+    )
+    path.write_bytes(contents)
+    git("config", "core.autocrlf", "true")
+    git("add", "skills/plan-task/SKILL.md")
+    git(
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        "Add synthetic skill",
+    )
+    return git, path, contents
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_index_flags_do_not_label_changed_skill_as_committed(
+    project, committed_skill, flag
+):
+    git, path, contents = committed_skill
+    relative = "skills/plan-task/SKILL.md"
+    git("update-index", flag, relative)
+    path.write_bytes(contents + b"\nChanged skill text.\n")
+    assert git("status", "--porcelain", "--", "skills") == b""
+    before = (project / ".git/index").read_bytes()
+    snapshot = installation.snapshot(project, ["plan-task"])
+    assert snapshot["revision"] is None
+    assert snapshot["files"]["plan-task"]["text"].endswith("Changed skill text.\n")
+    assert (project / ".git/index").read_bytes() == before
+
+
+def test_matching_crlf_skill_keeps_commit_revision(project, committed_skill):
+    git, path, contents = committed_skill
+    git("update-index", "--assume-unchanged", "skills/plan-task/SKILL.md")
+    path.write_bytes(contents.replace(b"\n", b"\r\n"))
+    assert installation.snapshot(project, ["plan-task"])["revision"] == git(
+        "rev-parse", "HEAD"
+    ).decode("ascii")
+
+
+@pytest.mark.parametrize("removal", ["uninstall", "update"])
+@pytest.mark.parametrize("occupied", [False, True])
+def test_rollback_preserves_unmanaged_skill_directory(project, removal, occupied):
+    install(project, "--skill", "plan-task")
+    managed = installation.target(project, "plan-task")
+    contents = managed.read_bytes()
+    note = managed.parent / "notes.md"
+    note.write_bytes(b"Unmanaged notes.")
+    if removal == "update":
+        run(project, "update", "--source", str(SOURCE), "--skill", "review-code")
+    else:
+        run(project, "uninstall")
+    assert not managed.exists()
+    assert note.read_bytes() == b"Unmanaged notes."
+    if occupied:
+        managed.write_bytes(contents)
+        run(project, "rollback", code=1)
+        assert set(json.loads(run(project, "status").output)["skills"]) == (
+            {"review-code"} if removal == "update" else set()
+        )
+    else:
+        run(project, "rollback")
+        assert json.loads(run(project, "status").output)["skills"] == {
+            "plan-task": "installed"
+        }
+    assert managed.read_bytes() == contents
+    assert note.read_bytes() == b"Unmanaged notes."
+    if not occupied:
+        note.unlink()
+        run(project, "uninstall")
+        assert managed.parent.is_dir()
+        install(project, "--skill", "plan-task")
+
+
 def test_subdirectory_and_doctor(project):
     working_dir = project / "folder with spaces"
     working_dir.mkdir()
